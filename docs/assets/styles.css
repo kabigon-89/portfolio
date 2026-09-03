@@ -65,16 +65,12 @@ body {
 
 .deck {
   height: 100dvh;
-  display: flex;
-  overflow-x: auto;
-  overflow-y: hidden;
-  scroll-snap-type: x mandatory;
+  overflow-y: auto;
+  scroll-snap-type: y mandatory;
   scroll-behavior: smooth;
 }
 
 .frame {
-  flex: none;
-  width: 100vw;
   height: 100dvh;
   scroll-snap-align: start;
   scroll-snap-stop: always;
@@ -82,6 +78,12 @@ body {
   position: relative;
   overflow: hidden;
 }
+
+/* Divider between stacked slides so consecutive same-color themes
+   (e.g. several "paper" slides in a row) still read as separate pages.
+   Uses the deck's own accent green — already the color used for the
+   progress bar and card rule-tops — so it reads on every theme. */
+.frame + .frame { border-top: 3px solid var(--green); }
 
 .stage {
   width: 1280px;
@@ -805,8 +807,8 @@ a:focus-visible { outline: 2px solid var(--green); outline-offset: 3px; }
    --------------------------------------------------------- */
 
 @media (max-width: 900px), (orientation: portrait) and (max-width: 1100px) {
-  .deck { display: block; scroll-snap-type: none; height: auto; overflow: visible; }
-  .frame { width: 100%; height: auto; display: block; overflow: visible; position: static; }
+  .deck { scroll-snap-type: none; height: auto; overflow: visible; }
+  .frame { height: auto; display: block; overflow: visible; position: static; }
   .stage {
     position: static;
     width: 100%;
@@ -849,7 +851,7 @@ a:focus-visible { outline: 2px solid var(--green); outline-offset: 3px; }
 @page { size: 1280px 720px; margin: 0; }
 
 @media print {
-  .deck { display: block; height: auto; overflow: visible; scroll-snap-type: none; }
+  .deck { height: auto; overflow: visible; scroll-snap-type: none; }
   .frame { height: 720px; width: 1280px; break-after: page; page-break-after: always; }
   .stage { position: static; transform: none; }
   .chrome, .progress, .notes { display: none !important; }

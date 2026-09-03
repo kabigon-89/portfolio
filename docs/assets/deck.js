@@ -111,10 +111,51 @@ document.getElementById('btnOverview').addEventListener('click', () => toggleOve
 document.getElementById('btnNotes').addEventListener('click', () => toggleNotes());
 
 frames.forEach((frame, i) => {
-  frame.addEventListener('click', () => {
-    if (document.body.classList.contains('overview')) goTo(i);
+  frame.addEventListener('click', (event) => {
+    if (document.body.classList.contains('overview')) {
+      goTo(i);
+      return;
+    }
+    if (event.target.closest('a')) return; // let links work normally
+    next();
   });
 });
+
+// ---------------------------------------------------------------
+// Touch swipe (mobile reading mode): swipe right advances,
+// swipe left goes back. In slide mode (desktop / tablet landscape)
+// the native horizontal scroll-snap already handles this.
+// ---------------------------------------------------------------
+
+let touchStartX = 0;
+let touchStartY = 0;
+
+deck.addEventListener(
+  'touchstart',
+  (event) => {
+    if (!isReadingMode() || document.body.classList.contains('overview')) return;
+    const t = event.touches[0];
+    touchStartX = t.clientX;
+    touchStartY = t.clientY;
+  },
+  { passive: true }
+);
+
+deck.addEventListener(
+  'touchend',
+  (event) => {
+    if (!isReadingMode() || document.body.classList.contains('overview')) return;
+    const t = event.changedTouches[0];
+    const dx = t.clientX - touchStartX;
+    const dy = t.clientY - touchStartY;
+    const SWIPE_THRESHOLD = 60;
+    if (Math.abs(dx) > SWIPE_THRESHOLD && Math.abs(dx) > Math.abs(dy) * 1.5) {
+      if (dx > 0) next();
+      else prev();
+    }
+  },
+  { passive: true }
+);
 
 document.addEventListener('keydown', (event) => {
   if (event.metaKey || event.ctrlKey || event.altKey) return;
@@ -124,6 +165,7 @@ document.addEventListener('keydown', (event) => {
     case 'ArrowDown':
     case 'PageDown':
     case ' ':
+    case 'Enter':
       event.preventDefault();
       next();
       break;
