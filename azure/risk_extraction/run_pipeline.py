@@ -55,9 +55,9 @@ def load_and_split_pdf(path):
     return articles
 
 
-# --- ② AIにリスク判定させる(Self-Consistency:3回判定) ---
-def judge_risk(title, body, n_trials=3):
-    prompt = f"""あなたは自治体の土地貸付契約を審査する、GRC専門家です。
+# --- ② AI判定 ---
+
+RISK_JUDGE_PROMPT = """あなたは自治体の土地貸付契約を審査する、GRC専門家です。
 以下の条文を読み、賃貸人にとってリスクとなる可能性がある内容かどうかを判定してください。
 
 【条文】
@@ -82,22 +82,47 @@ def judge_risk(title, body, n_trials=3):
   "reason": "判定理由を1〜2文で"
 }}
 """
+
+
+def _call_ai_once(title, body):
+    """AIに1回だけ問い合わせ、パースした結果を返す。JSON解析に失敗した場合はNoneを返す。"""
+    prompt = RISK_JUDGE_PROMPT.format(title=title, body=body)
+    response = aoai_client.chat.completions.create(
+        model="gpt-5-mini",
+        messages=[{"role": "user", "content": prompt}]
+    )
+    raw = response.choices[0].message.content
+    raw = raw.strip().strip("```json").strip("```").strip()
+    try:
+        return json.loads(raw)
+    except json.JSONDecodeError:
+        print(f"  [警告] JSON解析に失敗しました: {raw[:50]}")
+        return None
+
+
+def _level_label(score):
+    if score >= 70:
+        return "high"
+    elif score >= 40:
+        return "medium"
+    else:
+        return "low"
+
+
+def judge_risk_with_self_consistency(title, body, n_trials=3):
+    """
+    Self-Consistency検証: 同一条文に対しAIをn_trials回呼び出し、
+    多数決の一致率を確信度(confidence)として算出する。
+    Groundedness検証で根拠が薄いと判定された項目についてのみ呼び出される。
+    """
     results = []
     for _ in range(n_trials):
-        response = aoai_client.chat.completions.create(
-            model="gpt-5-mini",
-            messages=[{"role": "user", "content": prompt}]
-        )
-        raw = response.choices[0].message.content
-        raw = raw.strip().strip("```json").strip("```").strip()
-        try:
-            results.append(json.loads(raw))
-        except json.JSONDecodeError:
-            print(f"  [警告] JSON解析に失敗したため、この回はスキップします: {raw[:50]}")
-            continue
+        r = _call_ai_once(title, body)
+        if r is not None:
+            results.append(r)
 
     if not results:
-        # 3回とも失敗した場合の保険
+        # 複数回試みても全てJSON解析に失敗した場合の保険
         return {
             "confidence": 0,
             "risk_score": 0,
@@ -107,31 +132,34 @@ def judge_risk(title, body, n_trials=3):
         }
 
     risk_votes = [r["is_risk"] for r in results]
-    majority_vote = Counter(risk_votes).most_common(1)[0][0]  # 多数派の判定
-    confidence = risk_votes.count(majority_vote) / n_trials * 100
+    majority_vote = Counter(risk_votes).most_common(1)[0][0]
+    confidence = risk_votes.count(majority_vote) / len(results) * 100
 
     scores = [r["risk_score"] for r in results]
     avg_score = sum(scores) / len(scores)
 
-    if avg_score >= 70:
-        level_label = "high"
-    elif avg_score >= 40:
-        level_label = "medium"
-    else:
-        level_label = "low"
-
-    reason = results[0]["reason"]
-
     return {
         "confidence": confidence,
         "risk_score": avg_score,
-        "risk_level": level_label,
-        "reason": reason,
+        "risk_level": _level_label(avg_score),
+        "reason": results[0]["reason"],
         "score_reason": results[0]["score_reason"]
     }
 
-# --- ③ Groundedness検出 ---
+
+# --- ③ Groundedness検証 ---
 def check_groundedness(grounding_source, ai_answer):
+    """
+    AIの回答(ai_answer)が、引用元の条文原文(grounding_source)と整合しているかを検証する。
+    戻り値: (is_grounded: bool, groundedness_score: float 0〜100)
+    ungroundedPercentage(根拠から外れている割合)を100から引く形でスコア化する。
+
+    注意: reasoning=falseのままだと、Azure Content Safetyのgroundedness検出は
+    明らかに無関係な内容でもungroundedDetected=falseを返すことがある(Microsoft側でも
+    報告されている既知の挙動)。そのためreasoning=trueにし、判定の裏付けとして
+    Azure OpenAIのモデルを使わせる。これにはContent Safetyリソース側に
+    Azure OpenAIリソースへのアクセス権(マネージドID経由)が付与されている必要がある。
+    """
     url = f"{cs_endpoint}/contentsafety/text:detectGroundedness?api-version=2024-09-15-preview"
     headers = {"Ocp-Apim-Subscription-Key": cs_key, "Content-Type": "application/json"}
     body = {
@@ -139,11 +167,67 @@ def check_groundedness(grounding_source, ai_answer):
         "task": "QnA",
         "qna": {"query": "この条文にリスクはありますか？その理由は？"},
         "text": ai_answer,
-        "groundingSources": [grounding_source]
+        "groundingSources": [grounding_source],
+        "reasoning": True,
+        "llmResource": {
+            "resourceType": "AzureOpenAI",
+            "azureOpenAIEndpoint": os.getenv("AZURE_OPENAI_ENDPOINT"),
+            "azureOpenAIDeploymentName": "gpt-5-mini"
+        }
     }
     response = requests.post(url, headers=headers, json=body)
+
+    if response.status_code != 200:
+        # マネージドID経由のアクセス権が未設定の場合などにここで気づけるようにする
+        print(f"  [警告] Groundedness APIがエラーを返しました(status={response.status_code}): {response.text[:200]}")
+        return False, 0
+
     result = response.json()
-    return not result.get("ungroundedDetected", True)  # True=根拠あり
+
+    ungrounded_detected = result.get("ungroundedDetected", True)
+    ungrounded_percentage = result.get("ungroundedPercentage", 1.0)
+    groundedness_score = (1 - ungrounded_percentage) * 100
+
+    is_grounded = not ungrounded_detected
+    return is_grounded, groundedness_score
+
+
+# --- ④ 信頼度スコアの算出フロー(仕様書5章⑵①準拠) ---
+def judge_risk(title, body):
+    """
+    1. まず1回だけAIに判定させる
+    2. その回答をGroundedness検証にかけ、条文原文との整合性を確認する
+    3a. 整合性がある(is_grounded=True)場合
+        → 追加のAI呼び出しは行わず、Groundednessスコアをそのまま最終的な信頼度スコアとする
+    3b. 整合性が低い(is_grounded=False)場合のみ
+        → Self-Consistency検証(複数回再推論)を追加実行し、その一致率を最終的な信頼度スコアとする
+    """
+    first_result = _call_ai_once(title, body)
+
+    if first_result is None:
+        # 1回目の応答が壊れていた場合は、根拠検証をスキップしてSelf-Consistencyで立て直す
+        result = judge_risk_with_self_consistency(title, body)
+        result["is_grounded"] = False
+        result["confidence_source"] = "self_consistency"
+        return result
+
+    is_grounded, groundedness_score = check_groundedness(body, first_result["reason"])
+
+    if is_grounded:
+        return {
+            "confidence": groundedness_score,
+            "confidence_source": "groundedness",
+            "is_grounded": True,
+            "risk_score": first_result["risk_score"],
+            "risk_level": _level_label(first_result["risk_score"]),
+            "reason": first_result["reason"],
+            "score_reason": first_result["score_reason"]
+        }
+
+    result = judge_risk_with_self_consistency(title, body)
+    result["is_grounded"] = False
+    result["confidence_source"] = "self_consistency"
+    return result
 
 
 # --- メイン処理 ---
@@ -154,11 +238,11 @@ if __name__ == "__main__":
     for article in articles:
         print(f"=== {article['title']} ===")
         judgement = judge_risk(article["title"], article["body"])
-        is_grounded = check_groundedness(article["body"], judgement["reason"])
 
+        source_label = "Groundedness" if judgement["confidence_source"] == "groundedness" else "Self-Consistency"
         print(f"リスクスコア: {judgement['risk_score']:.0f}点（{judgement['risk_level']}）")
-        print(f"確信度: {judgement['confidence']:.0f}%")
-        print(f"根拠検証: {'OK(根拠あり)' if is_grounded else 'NG(要確認)'}")
+        print(f"信頼度: {judgement['confidence']:.0f}%（算出元: {source_label}）")
+        print(f"根拠検証: {'OK(根拠あり)' if judgement['is_grounded'] else 'NG(要確認のため再推論を実施)'}")
         print(f"理由: {judgement['reason']}")
         print(f"採点根拠: {judgement['score_reason']}")
         print()
